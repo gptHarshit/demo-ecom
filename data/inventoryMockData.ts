@@ -1,0 +1,68 @@
+import { InventoryProduct } from "@/types/inventory";
+
+export const INVENTORY_PRODUCTS: InventoryProduct[] = [
+  {
+    id: "prod-001",
+    name: "Men Oversized T-Shirt",
+    category: "T-Shirts",
+    price: 799,
+    quantity: 120,
+    isLive: true,
+  },
+  {
+    id: "prod-002",
+    name: "Slim Fit Jeans",
+    category: "Jeans",
+    price: 1599,
+    quantity: 65,
+    isLive: true,
+  },
+  {
+    id: "prod-003",
+    name: "Cotton Hoodie",
+    category: "Hoodies",
+    price: 1999,
+    quantity: 18,
+    isLive: true,
+  },
+  {
+    id: "prod-004",
+    name: "Classic Polo Shirt",
+    category: "T-Shirts",
+    price: 999,
+    quantity: 42,
+    isLive: true,
+  },
+  {
+    id: "prod-005",
+    name: "Regular Fit Chinos",
+    category: "Trousers",
+    price: 1399,
+    quantity: 8,
+    isLive: true,
+  },
+  {
+    id: "prod-006",
+    name: "Oversized Denim Jacket",
+    category: "Jackets",
+    price: 2499,
+    quantity: 0,
+    isLive: false,
+  },
+  {
+    id: "prod-007",
+    name: "Basic Cotton Shirt",
+    category: "Shirts",
+    price: 899,
+    quantity: 27,
+    isLive: true,
+  },
+  {
+    id: "prod-008",
+    name: "Relaxed Cargo Pants",
+    category: "Trousers",
+    price: 1799,
+    quantity: 4,
+    isLive: true,
+  },
+];
