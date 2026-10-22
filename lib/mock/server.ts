@@ -17,6 +17,31 @@ import {
   SEED_PRODUCTS,
   type SeedProduct,
 } from "./seed";
+import {
+  deductStock,
+  generateDemoOrders,
+  newEvent,
+  randomTracking,
+  releaseStock,
+  restock,
+  serializeOrder,
+  storeAddress,
+  variantTitleFrom,
+  type DbOrder,
+} from "./orders";
+import { findDiscount, priceOrder } from "@/lib/orders/pricing";
+import {
+  CHANNEL_LABEL,
+  COURIERS,
+  FULFILLMENT_LABEL,
+  PAYMENT_METHOD_LABEL,
+} from "@/lib/orders/format";
+import type {
+  FulfillmentStatus,
+  OrderLineItem,
+  PaymentMethod,
+  SalesChannel,
+} from "@/types/order";
 
 const STORAGE_KEY = "mlk_demo_db_v1";
 const ACCESS_TTL_MS = 15 * 60 * 1000;
@@ -87,6 +112,9 @@ interface DbProduct {
 interface DbCatalog {
   products: DbProduct[];
   optionTypes: DbOptionType[];
+  orders?: DbOrder[];
+  order_seq?: number;
+  order_prefix?: string;
 }
 
 interface DbToken {
@@ -488,6 +516,16 @@ function requireUser(db: Db, headers: Headers): { user: DbUser; business: DbBusi
     db.catalogs[business.id] = cat;
   }
 
+  // Workspaces created before the Orders feature get their demo orders here.
+  if (!Array.isArray(cat.orders)) {
+    const c = cat;
+    generateDemoOrders(c, {
+      businessId: business.id,
+      businessName: business.name,
+      resolveValue: (id) => resolveOptionValue(c, id),
+    });
+  }
+
   return { user, business, cat };
 }
 
@@ -554,6 +592,26 @@ function sameCombination(a: string[], b: string[]): boolean {
   if (a.length !== b.length) return false;
   const s = new Set(a);
   return b.every((x) => s.has(x));
+}
+
+function resolveOptionValue(cat: DbCatalog, valueId: string): string | undefined {
+  for (const t of cat.optionTypes) {
+    const v = t.values.find((x) => x.id === valueId);
+    if (v) return v.value;
+  }
+  return undefined;
+}
+
+const CHANNELS = Object.keys(CHANNEL_LABEL) as SalesChannel[];
+const METHODS = Object.keys(PAYMENT_METHOD_LABEL) as PaymentMethod[];
+const PHONE_RE = /^(\+?91[\s-]?)?[6-9]\d{4}[\s-]?\d{5}$/;
+const PIN_RE = /^\d{6}$/;
+const inr = (n: number | string) => `₹${Number(n).toLocaleString("en-IN", { maximumFractionDigits: 2 })}`;
+
+function findOrder(cat: DbCatalog, id: string): DbOrder {
+  const o = (cat.orders ?? []).find((x) => x.id === id);
+  if (!o) throw new HttpError(404, "ORDER_NOT_FOUND", "Order not found.");
+  return o;
 }
 
 /* ============================================================
@@ -1080,6 +1138,261 @@ function handle(method: string, path: string, query: URLSearchParams, body: Json
         product.updated_at = variant.updated_at;
         return { status: 200, body: serializeVariant(cat, variant) };
       }
+    }
+  }
+
+  /* ---------------- ORDERS ---------------- */
+
+  if (seg[0] === "orders") {
+    const orders = (cat.orders ??= []);
+    const orderId = seg[1];
+
+    if (!orderId) {
+      if (method === "GET") {
+        const sorted = [...orders].sort((a, b) => b.created_at.localeCompare(a.created_at));
+        return { status: 200, body: { orders: sorted.map(serializeOrder), total: sorted.length } };
+      }
+
+      if (method === "POST") {
+        const customerIn = (body.customer ?? {}) as Json;
+        const addressIn = (body.shipping_address ?? {}) as Json;
+        const channel = str(body.channel) as SalesChannel;
+        const paymentMethod = str(body.payment_method) as PaymentMethod;
+        const itemsIn = Array.isArray(body.items) ? (body.items as Json[]) : [];
+        const inStore = channel === "pos";
+
+        const fields: Record<string, string> = {};
+        const name = str(customerIn.name).trim();
+        const email = str(customerIn.email).trim().toLowerCase();
+        const phone = str(customerIn.phone).trim();
+        if (!name) fields.customer_name = "Customer name is required.";
+        if (!PHONE_RE.test(phone)) fields.customer_phone = "Enter a valid 10-digit Indian mobile number.";
+        if (email && !EMAIL_RE.test(email)) fields.customer_email = "Enter a valid email address.";
+        if (!CHANNELS.includes(channel)) fields.channel = "Pick a sales channel.";
+        if (!METHODS.includes(paymentMethod)) fields.payment_method = "Pick a payment method.";
+        if (!inStore) {
+          if (!str(addressIn.line1).trim()) fields.address_line1 = "Address is required.";
+          if (!str(addressIn.city).trim()) fields.address_city = "City is required.";
+          if (!str(addressIn.state).trim()) fields.address_state = "State is required.";
+          if (!PIN_RE.test(str(addressIn.pincode).trim())) fields.address_pincode = "Enter a 6-digit PIN code.";
+        }
+        if (itemsIn.length === 0) fields.items = "Add at least one product.";
+        if (Object.keys(fields).length) {
+          throw new HttpError(422, "VALIDATION_ERROR", "Please fix the highlighted fields.", fields);
+        }
+
+        // Resolve items and check stock (combining duplicate variants).
+        const wanted = new Map<string, number>();
+        const lines: OrderLineItem[] = [];
+        for (const row of itemsIn) {
+          const product = cat.products.find((p) => p.id === str(row.product_id));
+          if (!product || product.status === "archived") {
+            throw new HttpError(422, "INVALID_ORDER_ITEM", "One of the products is no longer available.");
+          }
+          const variant = product.variants.find((v) => v.id === str(row.variant_id));
+          if (!variant) throw new HttpError(422, "INVALID_ORDER_ITEM", `Pick a variant for "${product.name}".`);
+          const qty = Number(row.quantity);
+          if (!Number.isInteger(qty) || qty < 1) {
+            throw new HttpError(422, "INVALID_ORDER_ITEM", "Quantity must be at least 1.");
+          }
+          const total = (wanted.get(variant.id) ?? 0) + qty;
+          const available = variant.on_hand - variant.reserved;
+          if (total > available) {
+            throw new HttpError(
+              422,
+              "INSUFFICIENT_STOCK",
+              `Only ${Math.max(0, available)} unit(s) of ${variant.sku} available.`,
+            );
+          }
+          wanted.set(variant.id, total);
+          lines.push({
+            id: uid(),
+            product_id: product.id,
+            variant_id: variant.id,
+            name: product.name,
+            sku: variant.sku,
+            variant_title: variantTitleFrom(variant, (id) => resolveOptionValue(cat, id)),
+            unit_price: variant.price,
+            quantity: qty,
+            line_total: money(Number(variant.price) * qty),
+          });
+        }
+
+        const discountCode = str(body.discount_code).trim().toUpperCase() || undefined;
+        const pricing = priceOrder(
+          lines.map((l) => ({ unitPrice: Number(l.unit_price), quantity: l.quantity })),
+          { discountCode, inStore },
+        );
+        if (pricing.discountError) {
+          throw new HttpError(422, "INVALID_DISCOUNT_CODE", pricing.discountError, {
+            discount_code: pricing.discountError,
+          });
+        }
+
+        const ts = nowIso();
+        const paid = Boolean(body.mark_as_paid) || inStore;
+        const seq = cat.order_seq ?? 1001;
+        cat.order_seq = seq + 1;
+        const prefix = cat.order_prefix ?? "OR";
+
+        const order: DbOrder = {
+          id: uid(),
+          order_number: `#${prefix}-${seq}`,
+          customer: { name, email, phone },
+          shipping_address: inStore
+            ? storeAddress()
+            : {
+                line1: str(addressIn.line1).trim(),
+                line2: str(addressIn.line2).trim() || undefined,
+                city: str(addressIn.city).trim(),
+                state: str(addressIn.state).trim(),
+                pincode: str(addressIn.pincode).trim(),
+              },
+          channel,
+          payment_method: paymentMethod,
+          payment_status: paid ? "paid" : "pending",
+          fulfillment_status: "pending",
+          items: lines,
+          subtotal: money(pricing.subtotal),
+          discount: money(pricing.discount),
+          discount_code: findDiscount(discountCode)?.code,
+          shipping_fee: money(pricing.shipping),
+          tax_included: money(pricing.taxIncluded),
+          total: money(pricing.total),
+          note: str(body.note).trim() || undefined,
+          events: [
+            newEvent("placed", `Order created manually by ${user.name} (${CHANNEL_LABEL[channel]})`),
+          ],
+          created_at: ts,
+          updated_at: ts,
+          stock_state: "reserved",
+        };
+        if (paid) {
+          order.events.push(newEvent("payment", `Payment of ${inr(pricing.total)} recorded via ${PAYMENT_METHOD_LABEL[paymentMethod]}`));
+        }
+
+        // Reserve stock.
+        for (const l of lines) {
+          const v = cat.products.find((p) => p.id === l.product_id)!.variants.find((x) => x.id === l.variant_id)!;
+          v.reserved += l.quantity;
+          v.version += 1;
+          v.inventory_updated_at = ts;
+        }
+
+        if (inStore) {
+          deductStock(cat, order);
+          order.fulfillment_status = "delivered";
+          order.events.push(newEvent("delivered", "Handed over to the customer in store"));
+        }
+
+        orders.push(order);
+        return { status: 201, body: serializeOrder(order) };
+      }
+    }
+
+    const order = findOrder(cat, orderId);
+
+    if (seg.length === 2 && method === "GET") {
+      return { status: 200, body: serializeOrder(order) };
+    }
+
+    // PATCH /orders/:id/fulfillment  { status, courier?, tracking_number? }
+    if (seg[2] === "fulfillment" && method === "PATCH") {
+      const next = str(body.status) as FulfillmentStatus;
+      const allowed: Record<FulfillmentStatus, FulfillmentStatus[]> = {
+        pending: ["processing", "shipped", "delivered"],
+        processing: ["shipped", "delivered"],
+        shipped: ["delivered", "returned"],
+        delivered: ["returned"],
+        cancelled: [],
+        returned: [],
+      };
+      if (!allowed[order.fulfillment_status].includes(next)) {
+        throw new HttpError(
+          422,
+          "INVALID_STATUS_TRANSITION",
+          `Can't move an order from ${FULFILLMENT_LABEL[order.fulfillment_status]} to ${FULFILLMENT_LABEL[next] ?? next}.`,
+        );
+      }
+      if (order.payment_status === "failed" && next !== "processing") {
+        throw new HttpError(422, "PAYMENT_REQUIRED", "This order's payment failed. Mark it as paid before shipping.");
+      }
+
+      const ts = nowIso();
+      if (next === "processing") {
+        order.events.push(newEvent("confirmed", "Order confirmed"));
+        order.events.push(newEvent("packed", "Items packed at Main Warehouse"));
+      }
+      if (next === "shipped" || (next === "delivered" && !order.shipment)) {
+        const courier = COURIERS.includes(str(body.courier)) ? str(body.courier) : COURIERS[0];
+        const tracking = str(body.tracking_number).trim() || randomTracking(courier);
+        order.shipment = { courier, tracking_number: tracking, shipped_at: ts };
+        deductStock(cat, order);
+        if (order.channel !== "pos") order.events.push(newEvent("shipped", `Shipped via ${courier} · AWB ${tracking}`));
+      }
+      if (next === "delivered") {
+        deductStock(cat, order);
+        order.events.push(newEvent("delivered", "Delivered to the customer"));
+        if (order.payment_status === "pending" && order.payment_method === "cod") {
+          order.payment_status = "paid";
+          order.events.push(newEvent("payment", `Cash of ${inr(order.total)} collected on delivery`));
+        }
+      }
+      if (next === "returned") {
+        restock(cat, order);
+        order.events.push(newEvent("returned", "Return received. Items restocked at Main Warehouse."));
+        if (order.payment_status === "paid") {
+          order.payment_status = "refunded";
+          order.events.push(newEvent("refunded", `Refund of ${inr(order.total)} issued to ${PAYMENT_METHOD_LABEL[order.payment_method]}`));
+        } else if (order.payment_status === "pending") {
+          order.payment_status = "voided";
+        }
+      }
+
+      order.fulfillment_status = next;
+      order.updated_at = ts;
+      return { status: 200, body: serializeOrder(order) };
+    }
+
+    // POST /orders/:id/cancel  { reason }
+    if (seg[2] === "cancel" && method === "POST") {
+      if (order.fulfillment_status !== "pending" && order.fulfillment_status !== "processing") {
+        throw new HttpError(422, "ORDER_NOT_CANCELLABLE", "Only orders that haven't shipped yet can be cancelled.");
+      }
+      const reason = str(body.reason).trim() || "Cancelled by staff";
+      releaseStock(cat, order);
+      order.fulfillment_status = "cancelled";
+      order.cancel_reason = reason;
+      order.events.push(newEvent("cancelled", `Order cancelled — ${reason}. Reserved stock released.`));
+      if (order.payment_status === "paid") {
+        order.payment_status = "refunded";
+        order.events.push(newEvent("refunded", `Refund of ${inr(order.total)} issued to ${PAYMENT_METHOD_LABEL[order.payment_method]}`));
+      } else if (order.payment_status === "pending") {
+        order.payment_status = "voided";
+      }
+      order.updated_at = nowIso();
+      return { status: 200, body: serializeOrder(order) };
+    }
+
+    // POST /orders/:id/mark-paid
+    if (seg[2] === "mark-paid" && method === "POST") {
+      if (order.payment_status !== "pending" && order.payment_status !== "failed") {
+        throw new HttpError(422, "INVALID_PAYMENT_STATE", "This order isn't waiting for payment.");
+      }
+      order.payment_status = "paid";
+      order.events.push(newEvent("payment", `Payment of ${inr(order.total)} marked as received (${PAYMENT_METHOD_LABEL[order.payment_method]})`));
+      order.updated_at = nowIso();
+      return { status: 200, body: serializeOrder(order) };
+    }
+
+    // POST /orders/:id/notes  { note }
+    if (seg[2] === "notes" && method === "POST") {
+      const note = str(body.note).trim();
+      if (!note) throw new HttpError(422, "VALIDATION_ERROR", "Note can't be empty.", { note: "Note can't be empty." });
+      order.note = note;
+      order.events.push(newEvent("note", `${user.name}: ${note}`));
+      order.updated_at = nowIso();
+      return { status: 200, body: serializeOrder(order) };
     }
   }
 

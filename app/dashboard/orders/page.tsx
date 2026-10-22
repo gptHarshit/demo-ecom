@@ -1,9 +1,5 @@
-import React from 'react'
+import OrdersView from "@/components/orders/OrdersView";
 
-const page = () => {
-  return (
-    <div>Coming Soon...</div>
-  )
+export default function OrdersPage() {
+  return <OrdersView />;
 }
-
-export default page
